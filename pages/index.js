@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, Fragment } from 'react';
 import Head from 'next/head';
-import { PARTIDOS, FASES, CAMPEON_DEADLINE, calcularPuntos, calcularPuntosEliminatoria, calcularBonus, ganadorResultado, getEquipos, PEORES_SELECCIONES } from '../lib/datos';
+import { PARTIDOS, FASES, CAMPEON_DEADLINE, INSCRIPCION, REPARTO_PREMIOS, calcularPuntos, calcularPuntosEliminatoria, calcularBonus, ganadorResultado, getEquipos, PEORES_SELECCIONES } from '../lib/datos';
 
 const COLOR_MAP = {
   verde: 'bg-green-500 text-white',
@@ -381,6 +381,11 @@ export default function Home() {
     b.perfectos - a.perfectos ||
     Number(b.acertoCampeon) - Number(a.acertoCampeon)
   );
+
+  // Bote y premios: inscripción × participantes, repartido 60/25/15
+  const bote = jugadores.length * INSCRIPCION;
+  const premios = REPARTO_PREMIOS.map(p => bote * p);
+  const formatEuros = (n) => (Number.isInteger(n) ? `${n} €` : `${n.toFixed(2)} €`);
 
   const fasesDisponibles = [...new Set(partidosEliminatorias.map(p => p.fase))];
   const grupos = ['TODOS', ...new Set(partidosGrupos.map(p => p.grupo)), ...fasesDisponibles];
@@ -802,6 +807,29 @@ export default function Home() {
             <div className="max-w-lg mx-auto">
               <h2 className="text-xl font-black mb-4 text-yellow-400">🏆 Clasificación</h2>
 
+              {/* Bote y premios */}
+              <div className="mb-4 p-3 bg-gray-900 border border-gray-700 rounded-xl">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-bold text-green-400">💶 Bote total</p>
+                  <p className="text-lg font-black text-green-400">{formatEuros(bote)}</p>
+                </div>
+                <p className="text-xs text-gray-500 mb-2">{jugadores.length} participantes × {INSCRIPCION} € de inscripción</p>
+                <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                  <div className="bg-yellow-400/10 border border-yellow-400/40 rounded-lg py-1.5">
+                    <span className="block">🥇 60%</span>
+                    <span className="font-black text-yellow-400">{formatEuros(premios[0])}</span>
+                  </div>
+                  <div className="bg-gray-400/10 border border-gray-400/40 rounded-lg py-1.5">
+                    <span className="block">🥈 25%</span>
+                    <span className="font-black text-gray-300">{formatEuros(premios[1])}</span>
+                  </div>
+                  <div className="bg-orange-900/20 border border-orange-700/60 rounded-lg py-1.5">
+                    <span className="block">🥉 15%</span>
+                    <span className="font-black text-orange-400">{formatEuros(premios[2])}</span>
+                  </div>
+                </div>
+              </div>
+
               {/* Mi apuesta de Campeón del Mundo */}
               {user && !adminMode && (
                 <div className="mb-4 p-3 bg-gray-900 border border-gray-700 rounded-xl">
@@ -915,6 +943,9 @@ export default function Home() {
                       <span className="text-gray-400 text-sm"> pts</span>
                       {j.ptsBonus > 0 && (
                         <p className="text-xs text-purple-300">{j.ptsPronosticos} + {j.ptsBonus} 🎯</p>
+                      )}
+                      {i < 3 && (
+                        <p className="text-xs font-bold text-green-400">💶 {formatEuros(premios[i])}</p>
                       )}
                     </div>
                   </div>
@@ -1071,8 +1102,9 @@ function ReglasModal({ onClose }) {
             <p>1º Más aciertos perfectos (3 puntos). 2º Haber acertado el Campeón del Mundo. 3º Si sigue el empate, el premio se reparte.</p>
           </Seccion>
 
-          <Seccion titulo="💰 Pagos">
-            <p>En la clasificación se ve quién ha pagado (💰) y quién no (💸). Lo gestiona el admin.</p>
+          <Seccion titulo="💰 Inscripción y premios">
+            <p>Inscripción: <b>5 € por persona</b>. El bote se reparte: 🥇 ganador <b>60%</b>, 🥈 subcampeón <b>25%</b>, 🥉 tercero <b>15%</b>.</p>
+            <p>El bote y los premios se ven en la pestaña 🏆 Clasificación. Ahí también aparece quién ha pagado (💰) y quién no (💸); lo gestiona el admin.</p>
           </Seccion>
         </div>
 
