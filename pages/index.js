@@ -44,13 +44,8 @@ export default function Home() {
       if (data.partidos?.length > 0) {
         const map = {};
         data.partidos.forEach(p => {
-          // Intentamos mapear por nombre de equipo
-          const partido = PARTIDOS.find(mp =>
-            mp.local.toLowerCase().includes(p.local?.toLowerCase().split(' ')[0]) ||
-            mp.visitante.toLowerCase().includes(p.visitante?.toLowerCase().split(' ')[0])
-          );
-          if (partido && p.golesLocal !== null && p.golesVisitante !== null) {
-            map[partido.id] = {
+          if (p.partido_id && p.golesLocal !== null && p.golesLocal !== undefined) {
+            map[p.partido_id] = {
               golesLocal: p.golesLocal,
               golesVisitante: p.golesVisitante,
               estado: p.estado,
