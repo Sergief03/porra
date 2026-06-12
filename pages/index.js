@@ -1,12 +1,16 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, Fragment } from 'react';
 import Head from 'next/head';
-import { PARTIDOS, calcularPuntos } from '../lib/datos';
+import { PARTIDOS, FASES, CAMPEON_DEADLINE, calcularPuntos, calcularPuntosEliminatoria, calcularBonus, ganadorResultado, getEquipos, PEORES_SELECCIONES } from '../lib/datos';
 
 const COLOR_MAP = {
   verde: 'bg-green-500 text-white',
   amarillo: 'bg-yellow-400 text-gray-900',
   rojo: 'bg-red-500 text-white',
 };
+
+const EQUIPOS = getEquipos();
+const FLAGS = Object.fromEntries(EQUIPOS.map(e => [e.nombre, e.flag]));
+const OTRAS_SELECCIONES = EQUIPOS.filter(e => !PEORES_SELECCIONES.includes(e.nombre));
 
 const SESSION_KEY = 'porra_session';
 
@@ -21,6 +25,13 @@ export default function Home() {
   const [editandoResultado, setEditandoResultado] = useState(null);
   const [liveData, setLiveData] = useState({});
   const [saving, setSaving] = useState(false);
+  const [pagos, setPagos] = useState({});
+  const [bonusEquipos, setBonusEquipos] = useState({});
+  const [eliminatorias, setEliminatorias] = useState([]);
+  const [gruposApi, setGruposApi] = useState([]);
+  const [campeones, setCampeones] = useState({});
+  const [sincronizando, setSincronizando] = useState(false);
+  const [showReglas, setShowReglas] = useState(false);
   const [user, setUser] = useState(null); // { token, nombre, isAdmin }
   const [showLogin, setShowLogin] = useState(false);
 
@@ -43,6 +54,10 @@ export default function Home() {
     setUser(data);
     localStorage.setItem(SESSION_KEY, JSON.stringify(data));
     setShowLogin(false);
+    // La primera vez, mostrar el reglamento
+    if (!localStorage.getItem('porra_reglas_vistas')) {
+      setShowReglas(true);
+    }
   };
 
   const logout = () => {
@@ -57,6 +72,9 @@ export default function Home() {
       setJugadores(data.jugadores);
       setPronosticos(data.pronosticos);
       setResultados(data.resultados);
+      setPagos(data.pagos || {});
+      setBonusEquipos(data.bonusEquipos || {});
+      setCampeones(data.campeones || {});
     } catch (e) {
       console.error(e);
     } finally {
@@ -84,12 +102,36 @@ export default function Home() {
     } catch (e) {}
   }, []);
 
+  const cargarEliminatorias = useCallback(async (force = false, token = null) => {
+    try {
+      const r = await fetch(`/api/sync-eliminatorias${force ? '?force=1' : ''}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const data = await r.json();
+      if (Array.isArray(data.partidos)) setEliminatorias(data.partidos);
+      if (Array.isArray(data.grupos)) setGruposApi(data.grupos);
+    } catch (e) {}
+  }, []);
+
+  const sincronizarAhora = async () => {
+    setSincronizando(true);
+    try {
+      await cargarEliminatorias(true, user?.token);
+    } finally {
+      setSincronizando(false);
+    }
+  };
+
   useEffect(() => {
     cargarDatos();
     cargarLive();
-    const interval = setInterval(cargarLive, 60000); // refresh cada minuto
+    cargarEliminatorias();
+    const interval = setInterval(() => {
+      cargarLive();
+      cargarEliminatorias(); // el servidor cachea: solo llama a la API si pasaron 10 min
+    }, 60000);
     return () => clearInterval(interval);
-  }, [cargarDatos, cargarLive]);
+  }, [cargarDatos, cargarLive, cargarEliminatorias]);
 
   const api = async (action, payload) => {
     setSaving(true);
@@ -168,15 +210,46 @@ export default function Home() {
     }
   };
 
-  const guardarResultado = async (partidoId, golesLocal, golesVisitante) => {
-    setResultados(prev => ({ ...prev, [partidoId]: { golesLocal, golesVisitante } }));
+  const guardarResultado = async (partidoId, golesLocal, golesVisitante, ganadorPenales = null) => {
+    const nuevo = { golesLocal, golesVisitante, ...(ganadorPenales ? { ganadorPenales } : {}) };
+    setResultados(prev => ({ ...prev, [partidoId]: nuevo }));
     try {
-      await api('saveResultado', { partidoId, golesLocal, golesVisitante });
+      await api('saveResultado', { partidoId, golesLocal, golesVisitante, ganadorPenales });
     } catch (e) {
       alert(e.message);
       cargarDatos();
     }
     setEditandoResultado(null);
+  };
+
+  const togglePago = async (nombre) => {
+    const nuevo = !pagos[nombre];
+    setPagos(prev => ({ ...prev, [nombre]: nuevo }));
+    try {
+      await api('setPago', { nombre, pagado: nuevo });
+    } catch (e) {
+      setPagos(prev => ({ ...prev, [nombre]: !nuevo }));
+      alert(e.message);
+    }
+  };
+
+  const asignarBonusEquipo = async (jugador, equipo) => {
+    const previo = bonusEquipos[jugador];
+    setBonusEquipos(prev => {
+      const copia = { ...prev };
+      if (equipo) copia[jugador] = equipo; else delete copia[jugador];
+      return copia;
+    });
+    try {
+      await api('setBonusEquipo', { jugador, equipo: equipo || null });
+    } catch (e) {
+      setBonusEquipos(prev => {
+        const copia = { ...prev };
+        if (previo) copia[jugador] = previo; else delete copia[jugador];
+        return copia;
+      });
+      alert(e.message);
+    }
   };
 
   const borrarResultado = async (partidoId) => {
@@ -194,9 +267,44 @@ export default function Home() {
     setEditandoResultado(null);
   };
 
+  // Fecha y hora legibles a partir de la fecha UTC de la API
+  const conFechaLocal = (e) => {
+    const d = new Date(e.utcDate);
+    return {
+      ...e,
+      fecha: d.toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit' }),
+      hora: d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }),
+    };
+  };
+
+  // Fase de grupos: si la API ya sincronizó el calendario completo (72 partidos),
+  // se usa ese; si no, los 24 partidos originales del Excel
+  const partidosGrupos = gruposApi.length > 0 ? gruposApi.map(conFechaLocal) : PARTIDOS;
+
+  // Partidos de eliminatoria con formato común al resto de la app
+  const partidosEliminatorias = eliminatorias.map(e => ({
+    ...conFechaLocal(e),
+    esEliminatoria: true,
+    grupo: FASES[e.fase]?.corto || '?',
+    faseNombre: FASES[e.fase]?.nombre || e.fase,
+    local: e.local || 'Por definir',
+    visitante: e.visitante || 'Por definir',
+  }));
+
+  const todosPartidos = [...partidosGrupos, ...partidosEliminatorias];
+
+  // Resultados que vienen de la API (grupos y eliminatorias sincronizados)
+  const resultadosApi = {};
+  [...gruposApi, ...eliminatorias].forEach(p => {
+    if (p.resultado?.golesLocal !== undefined && p.resultado?.golesLocal !== null) {
+      resultadosApi[p.id] = p.resultado;
+    }
+  });
+
   const getResultado = (partidoId) => {
-    // Prioridad: resultado manual > live API
+    // Prioridad: resultado manual del admin > sincronizado > live
     if (resultados[partidoId]?.golesLocal !== undefined) return resultados[partidoId];
+    if (resultadosApi[partidoId]) return resultadosApi[partidoId];
     if (liveData[partidoId]) return liveData[partidoId];
     return null;
   };
@@ -205,26 +313,80 @@ export default function Home() {
 
   const puedeEditar = (jugador) => adminMode || user?.nombre === jugador;
 
+  const calcularPuntosPartido = (partido, pron, res) =>
+    partido.esEliminatoria ? calcularPuntosEliminatoria(pron, res) : calcularPuntos(pron, res);
+
+  // Campeón del Mundo: se detecta solo cuando la final tiene resultado
+  const partidoFinal = partidosEliminatorias.find(p => p.fase === 'FINAL' && p.definido);
+  const resFinal = partidoFinal ? getResultado(partidoFinal.id) : null;
+  const ganadorFinal = resFinal ? ganadorResultado(resFinal) : null;
+  const campeonReal = ganadorFinal === 'local' ? partidoFinal.local
+    : ganadorFinal === 'visitante' ? partidoFinal.visitante
+    : null;
+  const plazoCampeonAbierto = Date.now() < new Date(CAMPEON_DEADLINE).getTime();
+
+  const elegirCampeon = async (jugador, equipo) => {
+    const previo = campeones[jugador];
+    setCampeones(prev => {
+      const copia = { ...prev };
+      if (equipo) copia[jugador] = equipo; else delete copia[jugador];
+      return copia;
+    });
+    try {
+      await api('setCampeon', { jugador, equipo: equipo || null });
+    } catch (e) {
+      setCampeones(prev => {
+        const copia = { ...prev };
+        if (previo) copia[jugador] = previo; else delete copia[jugador];
+        return copia;
+      });
+      alert(e.message);
+    }
+  };
+
   // Clasificación
   const clasificacion = jugadores.map(j => {
-    let pts = 0, perfectos = 0, tendencias = 0, errores = 0, jugados = 0;
-    PARTIDOS.forEach(p => {
+    let ptsPronosticos = 0, perfectos = 0, tendencias = 0, errores = 0, jugados = 0;
+    todosPartidos.forEach(p => {
       const res = getResultado(p.id);
       const pron = getPronostico(j, p.id);
-      const calc = calcularPuntos(pron, res);
+      const calc = calcularPuntosPartido(p, pron, res);
       if (calc !== null) {
         jugados++;
-        pts += calc.puntos;
+        ptsPronosticos += calc.puntos;
         if (calc.color === 'verde') perfectos++;
         else if (calc.color === 'amarillo') tendencias++;
         else errores++;
       }
     });
-    return { nombre: j, pts, perfectos, tendencias, errores, jugados };
-  }).sort((a, b) => b.pts - a.pts || b.perfectos - a.perfectos);
+    const equipoBonus = bonusEquipos[j] || null;
+    const bonus = equipoBonus ? calcularBonus(equipoBonus, getResultado, partidosGrupos) : null;
+    const ptsBonus = bonus?.pts || 0;
+    const campeon = campeones[j] || null;
+    const acertoCampeon = !!(campeonReal && campeon === campeonReal);
+    return {
+      nombre: j,
+      pts: ptsPronosticos + ptsBonus,
+      ptsPronosticos,
+      ptsBonus,
+      equipoBonus,
+      bonus,
+      campeon,
+      acertoCampeon,
+      pagado: pagos[j] === true,
+      perfectos, tendencias, errores, jugados,
+    };
+  }).sort((a, b) =>
+    b.pts - a.pts ||
+    b.perfectos - a.perfectos ||
+    Number(b.acertoCampeon) - Number(a.acertoCampeon)
+  );
 
-  const grupos = ['TODOS', ...new Set(PARTIDOS.map(p => p.grupo))];
-  const partidosFiltrados = filtroGrupo === 'TODOS' ? PARTIDOS : PARTIDOS.filter(p => p.grupo === filtroGrupo);
+  const fasesDisponibles = [...new Set(partidosEliminatorias.map(p => p.fase))];
+  const grupos = ['TODOS', ...new Set(partidosGrupos.map(p => p.grupo)), ...fasesDisponibles];
+  const partidosFiltrados = filtroGrupo === 'TODOS'
+    ? todosPartidos
+    : todosPartidos.filter(p => p.grupo === filtroGrupo || p.fase === filtroGrupo);
 
   const VISTAS = [
     { id: 'tabla', icono: '📊', label: 'Tabla' },
@@ -270,6 +432,13 @@ export default function Home() {
 
             {/* Usuario */}
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowReglas(true)}
+                className="w-8 h-8 flex items-center justify-center bg-gray-800/80 hover:bg-gray-700 rounded-full text-sm font-bold"
+                title="Reglamento y cómo funciona"
+              >
+                ❓
+              </button>
               {user ? (
                 <div className="flex items-center gap-2 bg-gray-800/80 rounded-full pl-3 pr-1.5 py-1">
                   <span className={`text-sm font-semibold capitalize max-w-[100px] truncate ${adminMode ? 'text-red-400' : 'text-yellow-400'}`}>
@@ -338,15 +507,25 @@ export default function Home() {
                     </tr>
                   </thead>
                   <tbody>
-                    {PARTIDOS.map((partido, idx) => {
+                    {todosPartidos.map((partido, idx) => {
                       const resultado = getResultado(partido.id);
-                      const isLive = liveData[partido.id]?.estado === 'IN_PLAY' || liveData[partido.id]?.estado === 'PAUSED';
+                      const isLive = ['IN_PLAY', 'PAUSED', 'EXTRA_TIME', 'PENALTY_SHOOTOUT'].includes(partido.estado)
+                        || liveData[partido.id]?.estado === 'IN_PLAY' || liveData[partido.id]?.estado === 'PAUSED';
+                      const primeraEliminatoria = partido.esEliminatoria && !todosPartidos[idx - 1]?.esEliminatoria;
                       return (
-                        <tr key={partido.id} className={`border-t border-gray-800 ${idx % 2 === 0 ? 'bg-gray-900/30' : ''}`}>
+                        <Fragment key={partido.id}>
+                          {primeraEliminatoria && (
+                            <tr className="border-t-2 border-yellow-400/50 bg-yellow-400/10">
+                              <td colSpan={2 + jugadores.length} className="px-3 py-1.5 text-xs font-black text-yellow-400 tracking-widest">
+                                ⚔️ ELIMINATORIAS — sin empates, los penaltis deciden el ganador
+                              </td>
+                            </tr>
+                          )}
+                          <tr className={`border-t border-gray-800 ${idx % 2 === 0 ? 'bg-gray-900/30' : ''}`}>
                           {/* Partido */}
                           <td className="sticky left-0 bg-gray-950 z-10 px-3 py-2 border-r border-gray-700">
                             <div className="flex items-center gap-1 whitespace-nowrap">
-                              <span className="text-xs text-gray-500 w-5 text-center font-mono">{partido.grupo}</span>
+                              <span className="text-xs text-gray-500 w-5 text-center font-mono" title={partido.faseNombre}>{partido.grupo}</span>
                               <span className="text-xs">{partido.flagLocal}</span>
                               <span className="text-xs text-gray-300 max-w-[70px] truncate">{partido.local}</span>
                               <span className="text-gray-500 text-xs">vs</span>
@@ -367,6 +546,7 @@ export default function Home() {
                                 className={`font-mono font-bold text-sm ${adminMode ? 'hover:text-yellow-400 cursor-pointer' : 'cursor-default'}`}
                               >
                                 {resultado.golesLocal} - {resultado.golesVisitante}
+                                <PenalesInfo resultado={resultado} />
                               </button>
                             ) : (
                               adminMode ? (
@@ -394,7 +574,7 @@ export default function Home() {
                           {/* Pronósticos de cada jugador */}
                           {jugadores.map(j => {
                             const pron = getPronostico(j, partido.id);
-                            const calc = resultado ? calcularPuntos(pron, resultado) : null;
+                            const calc = resultado ? calcularPuntosPartido(partido, pron, resultado) : null;
                             const esPropio = user?.nombre === j;
                             return (
                               <td
@@ -416,7 +596,8 @@ export default function Home() {
                               </td>
                             );
                           })}
-                        </tr>
+                          </tr>
+                        </Fragment>
                       );
                     })}
                   </tbody>
@@ -430,7 +611,9 @@ export default function Home() {
                         return (
                           <td key={j} className="px-2 py-2 text-center border-r border-gray-700 last:border-r-0">
                             <span className="font-black text-yellow-400 text-base">{c?.pts ?? 0}</span>
-                            <span className="text-gray-400 text-xs block">pts</span>
+                            <span className="text-gray-400 text-xs block">
+                              pts{c?.ptsBonus > 0 && <span className="text-purple-300" title={`Incluye +${c.ptsBonus} del bonus de ${c.equipoBonus}`}> (+{c.ptsBonus} 🎯)</span>}
+                            </span>
                           </td>
                         );
                       })}
@@ -475,30 +658,65 @@ export default function Home() {
           {vista === 'partidos' && (
             <div>
               <div className="flex gap-2 overflow-x-auto pb-2 mb-3 -mx-2 px-2 sm:flex-wrap sm:overflow-visible">
-                {grupos.map(g => (
-                  <button
-                    key={g}
-                    onClick={() => setFiltroGrupo(g)}
-                    className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all whitespace-nowrap flex-shrink-0 ${
-                      filtroGrupo === g ? 'bg-yellow-400 text-gray-900' : 'bg-gray-800 hover:bg-gray-700'
-                    }`}
-                  >
-                    {g === 'TODOS' ? 'Todos' : `Grupo ${g}`}
-                  </button>
-                ))}
+                {grupos.map(g => {
+                  let label = `Grupo ${g}`;
+                  if (g === 'TODOS') label = 'Todos';
+                  else if (FASES[g]) label = `⚔️ ${FASES[g].nombre}`;
+                  return (
+                    <button
+                      key={g}
+                      onClick={() => setFiltroGrupo(g)}
+                      className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all whitespace-nowrap flex-shrink-0 ${
+                        filtroGrupo === g ? 'bg-yellow-400 text-gray-900' : 'bg-gray-800 hover:bg-gray-700'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
               {saving && <p className="text-yellow-400 text-sm animate-pulse mb-2">Guardando...</p>}
+
+              {/* Estado de las eliminatorias */}
+              {eliminatorias.length === 0 && (
+                <div className="mb-3 p-3 bg-gray-900 border border-gray-800 rounded-xl text-xs text-gray-400 flex items-center justify-between gap-2 flex-wrap">
+                  <span>⚔️ Las eliminatorias (dieciseisavos → final) aparecerán aquí automáticamente cuando la FIFA confirme los cruces (a partir del 28 de junio).</span>
+                  {adminMode && (
+                    <button
+                      onClick={sincronizarAhora}
+                      disabled={sincronizando}
+                      className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-semibold disabled:opacity-50 flex-shrink-0"
+                    >
+                      {sincronizando ? 'Sincronizando...' : '🔄 Sincronizar ahora'}
+                    </button>
+                  )}
+                </div>
+              )}
+              {eliminatorias.length > 0 && adminMode && (
+                <div className="mb-3 flex justify-end">
+                  <button
+                    onClick={sincronizarAhora}
+                    disabled={sincronizando}
+                    className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs font-semibold disabled:opacity-50"
+                  >
+                    {sincronizando ? 'Sincronizando...' : '🔄 Sincronizar eliminatorias'}
+                  </button>
+                </div>
+              )}
 
               <div className="grid gap-3 md:grid-cols-2">
                 {partidosFiltrados.map(partido => {
                   const resultado = getResultado(partido.id);
-                  const isLive = liveData[partido.id]?.estado === 'IN_PLAY';
+                  const isLive = ['IN_PLAY', 'PAUSED', 'EXTRA_TIME', 'PENALTY_SHOOTOUT'].includes(partido.estado)
+                    || liveData[partido.id]?.estado === 'IN_PLAY';
                   const miPron = user && !adminMode ? getPronostico(user.nombre, partido.id) : null;
-                  const bloqueado = (partidoEmpezado(partido) || !!resultado) && !adminMode;
+                  const bloqueado = (partidoEmpezado(partido) || !!resultado || partido.definido === false) && !adminMode;
                   return (
-                    <div key={partido.id} className="bg-gray-900 border border-gray-700 rounded-xl p-4">
+                    <div key={partido.id} className={`bg-gray-900 border rounded-xl p-4 ${partido.esEliminatoria ? 'border-yellow-400/40' : 'border-gray-700'}`}>
                       <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs text-gray-400">{partido.fecha} · {partido.hora} · Grupo {partido.grupo}</span>
+                        <span className="text-xs text-gray-400">
+                          {partido.fecha} · {partido.hora} · {partido.esEliminatoria ? `⚔️ ${partido.faseNombre}` : `Grupo ${partido.grupo}`}
+                        </span>
                         {isLive && <span className="text-xs text-red-400 animate-pulse font-bold">🔴 EN VIVO</span>}
                       </div>
                       <div className="flex items-center justify-between mb-3 gap-2">
@@ -508,7 +726,10 @@ export default function Home() {
                         </div>
                         <div className="text-center flex-shrink-0">
                           {resultado ? (
-                            <span className="text-xl font-black">{resultado.golesLocal} - {resultado.golesVisitante}</span>
+                            <span className="text-xl font-black">
+                              {resultado.golesLocal} - {resultado.golesVisitante}
+                              <PenalesInfo resultado={resultado} />
+                            </span>
                           ) : (
                             <span className="text-gray-500">vs</span>
                           )}
@@ -554,7 +775,7 @@ export default function Home() {
                         <div className="flex flex-wrap gap-2">
                           {jugadores.map(j => {
                             const pron = getPronostico(j, partido.id);
-                            const calc = resultado ? calcularPuntos(pron, resultado) : null;
+                            const calc = resultado ? calcularPuntosPartido(partido, pron, resultado) : null;
                             const bgClass = calc ? COLOR_MAP[calc.color] : 'bg-gray-800';
                             return (
                               <div key={j} className={`rounded-lg px-2 py-1 text-xs ${bgClass} ${user?.nombre === j ? 'ring-1 ring-yellow-400' : ''}`}>
@@ -580,6 +801,43 @@ export default function Home() {
           {vista === 'clasificacion' && (
             <div className="max-w-lg mx-auto">
               <h2 className="text-xl font-black mb-4 text-yellow-400">🏆 Clasificación</h2>
+
+              {/* Mi apuesta de Campeón del Mundo */}
+              {user && !adminMode && (
+                <div className="mb-4 p-3 bg-gray-900 border border-gray-700 rounded-xl">
+                  <p className="text-sm font-bold text-yellow-400 mb-1">👑 Tu Campeón del Mundo</p>
+                  {plazoCampeonAbierto ? (
+                    <>
+                      <p className="text-xs text-gray-500 mb-2">
+                        Elige quién crees que ganará el Mundial (puedes cambiarlo hasta que empiecen las eliminatorias el 28 de junio). Sirve de desempate en la clasificación final.
+                      </p>
+                      <select
+                        value={campeones[user.nombre] || ''}
+                        onChange={e => elegirCampeon(user.nombre, e.target.value)}
+                        className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-yellow-400"
+                      >
+                        <option value="">— Elige tu campeón —</option>
+                        {EQUIPOS.map(eq => (
+                          <option key={eq.nombre} value={eq.nombre}>{eq.flag} {eq.nombre}</option>
+                        ))}
+                      </select>
+                    </>
+                  ) : (
+                    <p className="text-sm">
+                      {campeones[user.nombre]
+                        ? <>Tu apuesta: <span className="font-bold">{FLAGS[campeones[user.nombre]]} {campeones[user.nombre]}</span> (plazo cerrado)</>
+                        : <span className="text-gray-500">No elegiste campeón antes del cierre del plazo.</span>}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {campeonReal && (
+                <div className="mb-4 p-3 bg-yellow-400/10 border border-yellow-400 rounded-xl text-center">
+                  <p className="text-sm font-black text-yellow-400">👑 CAMPEÓN DEL MUNDO: {FLAGS[campeonReal]} {campeonReal}</p>
+                </div>
+              )}
+
               <div className="space-y-2">
                 {clasificacion.map((j, i) => (
                   <div
@@ -594,24 +852,132 @@ export default function Home() {
                     <span className="text-2xl font-black w-8 text-center">
                       {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}º`}
                     </span>
-                    <div className="flex-1">
+                    <div className="flex-1 min-w-0">
                       <p className="font-bold capitalize text-base">
                         {j.nombre} {user?.nombre === j.nombre && <span className="text-yellow-400 text-xs">(tú)</span>}
                       </p>
-                      <div className="flex gap-3 text-xs mt-1">
+                      <div className="flex gap-3 text-xs mt-1 flex-wrap">
                         <span className="text-green-400">✅ {j.perfectos}</span>
                         <span className="text-yellow-400">🟡 {j.tendencias}</span>
                         <span className="text-red-400">❌ {j.errores}</span>
                         <span className="text-gray-400">{j.jugados} jugados</span>
                       </div>
+                      <div className="flex gap-1.5 mt-2 flex-wrap items-center">
+                        {/* Estado de pago (visible para todos, editable por admin) */}
+                        {adminMode ? (
+                          <button
+                            onClick={() => togglePago(j.nombre)}
+                            className={`text-xs font-semibold px-2 py-0.5 rounded-full border transition-colors ${
+                              j.pagado
+                                ? 'bg-green-500/15 border-green-500 text-green-400 hover:bg-green-500/30'
+                                : 'bg-red-500/15 border-red-500 text-red-400 hover:bg-red-500/30'
+                            }`}
+                            title="Toca para cambiar el estado de pago"
+                          >
+                            {j.pagado ? '💰 Pagado' : '💸 No pagado'}
+                          </button>
+                        ) : (
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${
+                            j.pagado
+                              ? 'bg-green-500/15 border-green-500 text-green-400'
+                              : 'bg-red-500/15 border-red-500 text-red-400'
+                          }`}>
+                            {j.pagado ? '💰 Pagado' : '💸 No pagado'}
+                          </span>
+                        )}
+                        {/* Equipo bonus */}
+                        {j.equipoBonus && (
+                          <span
+                            className="text-xs font-semibold px-2 py-0.5 rounded-full border border-purple-500 bg-purple-500/15 text-purple-300"
+                            title={`Bonus: ${j.bonus.golesFavor} goles a favor, ${j.bonus.golesContra} en contra en ${j.bonus.jugados} partidos`}
+                          >
+                            🎯 {FLAGS[j.equipoBonus]} {j.equipoBonus}
+                            {j.ptsBonus > 0 && <span className="ml-1 font-black">+{j.ptsBonus}</span>}
+                          </span>
+                        )}
+                        {/* Apuesta de campeón */}
+                        {j.campeon && (
+                          <span
+                            className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${
+                              j.acertoCampeon
+                                ? 'border-yellow-400 bg-yellow-400/20 text-yellow-300'
+                                : 'border-gray-600 bg-gray-800 text-gray-300'
+                            }`}
+                            title={j.acertoCampeon ? '¡Acertó el Campeón del Mundo!' : 'Su apuesta de campeón (desempate)'}
+                          >
+                            👑 {FLAGS[j.campeon]} {j.campeon} {j.acertoCampeon && '✓'}
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <div className="text-right">
+                    <div className="text-right flex-shrink-0">
                       <span className="text-3xl font-black text-yellow-400">{j.pts}</span>
                       <span className="text-gray-400 text-sm"> pts</span>
+                      {j.ptsBonus > 0 && (
+                        <p className="text-xs text-purple-300">{j.ptsPronosticos} + {j.ptsBonus} 🎯</p>
+                      )}
                     </div>
                   </div>
                 ))}
               </div>
+
+              {/* Leyenda del bonus */}
+              <div className="mt-4 p-3 bg-gray-900 border border-gray-800 rounded-xl text-xs text-gray-400">
+                <p className="font-semibold text-purple-300 mb-1">🎯 Bonus peores selecciones</p>
+                <p>Cada participante tiene asignada una de las 14 peores selecciones del Mundial: +1 punto por cada gol a favor de tu equipo y +1 punto por cada 3 goles en contra en un partido. Se suma automáticamente al total.</p>
+              </div>
+
+              {/* Panel admin: pagos y asignación de equipos bonus */}
+              {adminMode && (
+                <div className="mt-4 p-4 bg-gray-900 rounded-xl border border-gray-700">
+                  <h3 className="text-sm font-bold text-yellow-400 mb-1">🎯 Bonus y 👑 campeón de cada participante</h3>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Primer desplegable: una de las 14 peores selecciones (bonus). Segundo: su apuesta de Campeón del Mundo.
+                    El estado de pago se cambia tocando la insignia 💰/💸 de cada uno en la lista de arriba.
+                  </p>
+                  <div className="space-y-2">
+                    {jugadores.map(j => {
+                      const asignado = bonusEquipos[j] || '';
+                      const repetido = asignado && jugadores.some(otro => otro !== j && bonusEquipos[otro] === asignado);
+                      return (
+                        <div key={j} className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                          <span className="capitalize text-sm w-28 truncate flex-shrink-0">{j}</span>
+                          <select
+                            value={asignado}
+                            onChange={e => asignarBonusEquipo(j, e.target.value)}
+                            className="flex-1 min-w-[140px] bg-gray-800 border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-yellow-400"
+                            title="Equipo bonus (peores selecciones)"
+                          >
+                            <option value="">🎯 Sin equipo bonus</option>
+                            <optgroup label="Peores selecciones (sugeridas)">
+                              {PEORES_SELECCIONES.map(eq => (
+                                <option key={eq} value={eq}>{FLAGS[eq]} {eq}</option>
+                              ))}
+                            </optgroup>
+                            <optgroup label="Resto de selecciones">
+                              {OTRAS_SELECCIONES.map(eq => (
+                                <option key={eq.nombre} value={eq.nombre}>{eq.flag} {eq.nombre}</option>
+                              ))}
+                            </optgroup>
+                          </select>
+                          <select
+                            value={campeones[j] || ''}
+                            onChange={e => elegirCampeon(j, e.target.value)}
+                            className="flex-1 min-w-[140px] bg-gray-800 border border-gray-600 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-yellow-400"
+                            title="Apuesta de Campeón del Mundo"
+                          >
+                            <option value="">👑 Sin campeón</option>
+                            {EQUIPOS.map(eq => (
+                              <option key={eq.nombre} value={eq.nombre}>{eq.flag} {eq.nombre}</option>
+                            ))}
+                          </select>
+                          {repetido && <span className="text-xs text-orange-400 flex-shrink-0" title="Este equipo está asignado a más de un participante">⚠️</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </main>
@@ -639,18 +1005,111 @@ export default function Home() {
       {showLogin && (
         <LoginModal onLogin={login} onClose={() => setShowLogin(false)} />
       )}
+
+      {/* Modal de reglamento */}
+      {showReglas && (
+        <ReglasModal
+          onClose={() => {
+            localStorage.setItem('porra_reglas_vistas', '1');
+            setShowReglas(false);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+// ===== Modal con el reglamento y el funcionamiento de la app =====
+function ReglasModal({ onClose }) {
+  const Seccion = ({ titulo, children }) => (
+    <div className="mb-4">
+      <h4 className="font-bold text-yellow-400 text-sm mb-1.5">{titulo}</h4>
+      <div className="text-sm text-gray-300 space-y-1.5">{children}</div>
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-md max-h-[85vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="p-5 pb-3 border-b border-gray-800">
+          <h3 className="font-black text-lg">📋 Reglamento de la porra</h3>
+        </div>
+
+        <div className="p-5 overflow-y-auto flex-1">
+          <Seccion titulo="🔑 Cómo funciona la app">
+            <p>Entra con tu <b>nombre de participante</b>. La primera vez crearás tu contraseña.</p>
+            <p>Solo puedes poner, cambiar o borrar <b>tus propios pronósticos</b> (tu columna está marcada con ⭐), y solo <b>hasta que el partido empiece</b>.</p>
+            <p>En el móvil, la pestaña <b>⚽ Partidos</b> es la más cómoda: cada partido tiene tu casilla de pronóstico en grande.</p>
+          </Seccion>
+
+          <Seccion titulo="🎯 Puntuación">
+            <p><span className="inline-block w-3 h-3 rounded-full bg-green-500 mr-1"></span><b>3 puntos</b> — Acierto perfecto: marcador exacto (pusiste 2-1 y quedó 2-1).</p>
+            <p><span className="inline-block w-3 h-3 rounded-full bg-yellow-400 mr-1"></span><b>1 punto</b> — Tendencia: aciertas quién gana o el empate, sin el marcador exacto.</p>
+            <p><span className="inline-block w-3 h-3 rounded-full bg-red-500 mr-1"></span><b>0 puntos</b> — Error total.</p>
+          </Seccion>
+
+          <Seccion titulo="⚔️ Eliminatorias (desde el 28 de junio)">
+            <p>Los cruces aparecen solos en la app cuando la FIFA los confirma.</p>
+            <p><b>No se puede pronosticar empate</b>: pon siempre un ganador.</p>
+            <p>Cuenta el marcador de los <b>90 minutos + prórroga</b>. Si hay penaltis, el que los gane cuenta como ganador para la tendencia (1 punto como máximo, como dice el reglamento).</p>
+          </Seccion>
+
+          <Seccion titulo="🎯 Bonus: peores selecciones">
+            <p>Cada participante tiene asignada una de las 14 peores selecciones del Mundial. Con ella sumas extra en sus partidos de grupos:</p>
+            <p>• <b>+1 punto</b> por cada gol a favor de tu equipo.</p>
+            <p>• <b>+1 punto</b> por cada 3 goles en contra en un partido.</p>
+          </Seccion>
+
+          <Seccion titulo="👑 Campeón del Mundo">
+            <p>En la pestaña 🏆 Clasificación puedes elegir tu campeón <b>hasta el 28 de junio</b>. Acertarlo es el segundo criterio de desempate.</p>
+          </Seccion>
+
+          <Seccion titulo="🏆 Desempates en la clasificación final">
+            <p>1º Más aciertos perfectos (3 puntos). 2º Haber acertado el Campeón del Mundo. 3º Si sigue el empate, el premio se reparte.</p>
+          </Seccion>
+
+          <Seccion titulo="💰 Pagos">
+            <p>En la clasificación se ve quién ha pagado (💰) y quién no (💸). Lo gestiona el admin.</p>
+          </Seccion>
+        </div>
+
+        <div className="p-4 border-t border-gray-800">
+          <button
+            onClick={onClose}
+            className="w-full py-3 bg-yellow-400 text-gray-900 font-bold rounded-lg active:scale-95 transition-transform"
+          >
+            ¡Entendido, a jugar! ⚽
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
 // Devuelve true si el partido ya ha empezado
 function partidoEmpezado(partido) {
+  // Eliminatorias: la API ya da la fecha exacta en UTC
+  if (partido.utcDate) return new Date() >= new Date(partido.utcDate);
   const [h, m] = partido.hora.split(':').map(Number);
   const utcH = h - 2; // CEST = UTC+2
   const utcDay = utcH < 0 ? 1 : 0;
   const utcHAdj = utcH < 0 ? utcH + 24 : utcH;
   const fechaStr = `${partido.fecha}T${String(utcHAdj).padStart(2,'0')}:${String(m).padStart(2,'0')}:00Z`;
   return new Date() >= new Date(fechaStr);
+}
+
+// Marcador de penaltis junto al resultado (solo eliminatorias)
+function PenalesInfo({ resultado }) {
+  if (resultado?.penalesLocal !== undefined && resultado?.penalesLocal !== null) {
+    return <span className="block text-xs text-gray-400 font-normal">🥅 {resultado.penalesLocal}-{resultado.penalesVisitante} pen</span>;
+  }
+  if (resultado?.ganadorPenales) {
+    return <span className="block text-xs text-gray-400 font-normal">🥅 gana {resultado.ganadorPenales} en penaltis</span>;
+  }
+  return null;
 }
 
 // ===== Modal de login / registro =====
@@ -868,7 +1327,17 @@ function MiPronosticoEditor({ partido, pronostico, bloqueado, resultado, onSave,
   }, [pronostico]);
 
   const cambiado = String(gL) !== String(pronostico?.golesLocal ?? '') || String(gV) !== String(pronostico?.golesVisitante ?? '');
-  const calc = resultado && pronostico ? calcularPuntos(pronostico, resultado) : null;
+  const calc = resultado && pronostico
+    ? (partido.esEliminatoria ? calcularPuntosEliminatoria(pronostico, resultado) : calcularPuntos(pronostico, resultado))
+    : null;
+
+  const guardar = () => {
+    if (partido.esEliminatoria && parseInt(gL) === parseInt(gV)) {
+      alert('⚔️ En eliminatorias no puede haber empate: pon un ganador (los penaltis deciden).');
+      return;
+    }
+    onSave(parseInt(gL), parseInt(gV));
+  };
 
   if (bloqueado) {
     return (
@@ -901,7 +1370,7 @@ function MiPronosticoEditor({ partido, pronostico, bloqueado, resultado, onSave,
           />
           {cambiado && gL !== '' && gV !== '' && (
             <button
-              onClick={() => onSave(parseInt(gL), parseInt(gV))}
+              onClick={guardar}
               className="h-11 px-3 bg-green-600 hover:bg-green-500 rounded-lg font-bold text-sm active:scale-95 transition-transform"
             >
               ✓
@@ -928,7 +1397,7 @@ function PronosticoCell({ jugador, partido, pronostico, onSave, onDelete, result
   const [gL, setGL] = useState('');
   const [gV, setGV] = useState('');
 
-  const bloqueado = !editable || ((partidoEmpezado(partido) || !!resultado) && !adminMode);
+  const bloqueado = !editable || partido.definido === false || ((partidoEmpezado(partido) || !!resultado) && !adminMode);
 
   const startEdit = () => {
     if (bloqueado) return;
@@ -939,6 +1408,10 @@ function PronosticoCell({ jugador, partido, pronostico, onSave, onDelete, result
 
   const save = async () => {
     if (gL === '' || gV === '') return;
+    if (partido.esEliminatoria && parseInt(gL) === parseInt(gV)) {
+      alert('⚔️ En eliminatorias no puede haber empate: pon un ganador (los penaltis deciden).');
+      return;
+    }
     setEditing(false);
     await onSave(jugador, partido.id, parseInt(gL), parseInt(gV));
   };
@@ -999,6 +1472,16 @@ function PronosticoCell({ jugador, partido, pronostico, onSave, onDelete, result
 function ResultadoEditor({ partido, resultadoActual, onSave, onDelete, onClose }) {
   const [gL, setGL] = useState(resultadoActual?.golesLocal ?? '');
   const [gV, setGV] = useState(resultadoActual?.golesVisitante ?? '');
+  const [ganadorPen, setGanadorPen] = useState(resultadoActual?.ganadorPenales ?? null);
+
+  const esEmpate = gL !== '' && gV !== '' && parseInt(gL) === parseInt(gV);
+  const necesitaPenales = partido.esEliminatoria && esEmpate;
+  const puedeGuardar = gL !== '' && gV !== '' && (!necesitaPenales || ganadorPen);
+
+  const guardar = () => {
+    if (!puedeGuardar) return;
+    onSave(partido.id, parseInt(gL), parseInt(gV), necesitaPenales ? ganadorPen : null);
+  };
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
@@ -1020,14 +1503,38 @@ function ResultadoEditor({ partido, resultadoActual, onSave, onDelete, onClose }
             <input
               type="number" inputMode="numeric" min="0" max="20" value={gV} onChange={e => setGV(e.target.value)}
               className="w-16 text-center bg-gray-800 border border-gray-600 rounded-lg p-2 text-xl font-bold focus:outline-none focus:border-yellow-400"
-              onKeyDown={e => e.key === 'Enter' && gL !== '' && gV !== '' && onSave(partido.id, parseInt(gL), parseInt(gV))}
+              onKeyDown={e => e.key === 'Enter' && guardar()}
             />
           </div>
         </div>
+        {/* Empate en eliminatoria: hay que indicar quién ganó los penaltis */}
+        {necesitaPenales && (
+          <div className="mb-4">
+            <p className="text-xs text-yellow-400 font-semibold mb-2">🥅 Empate: ¿quién ganó en los penaltis?</p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setGanadorPen('local')}
+                className={`flex-1 py-2 rounded-lg text-sm font-semibold border ${
+                  ganadorPen === 'local' ? 'bg-yellow-400 text-gray-900 border-yellow-400' : 'bg-gray-800 border-gray-600 hover:border-yellow-400'
+                }`}
+              >
+                {partido.flagLocal} {partido.local}
+              </button>
+              <button
+                onClick={() => setGanadorPen('visitante')}
+                className={`flex-1 py-2 rounded-lg text-sm font-semibold border ${
+                  ganadorPen === 'visitante' ? 'bg-yellow-400 text-gray-900 border-yellow-400' : 'bg-gray-800 border-gray-600 hover:border-yellow-400'
+                }`}
+              >
+                {partido.flagVisitante} {partido.visitante}
+              </button>
+            </div>
+          </div>
+        )}
         <div className="flex gap-2">
           <button
-            onClick={() => gL !== '' && gV !== '' && onSave(partido.id, parseInt(gL), parseInt(gV))}
-            disabled={gL === '' || gV === ''}
+            onClick={guardar}
+            disabled={!puedeGuardar}
             className="flex-1 py-2 bg-yellow-400 text-gray-900 font-bold rounded-lg disabled:opacity-50"
           >
             Guardar
