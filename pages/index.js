@@ -275,6 +275,7 @@ export default function Home() {
                                   pronostico={pron}
                                   onSave={guardarPronostico}
                                   resultado={resultado}
+                                  adminMode={adminMode}
                                 />
                               </td>
                             );
@@ -526,14 +527,27 @@ export default function Home() {
   );
 }
 
+// Devuelve true si el partido ya ha empezado
+function partidoEmpezado(partido) {
+  const [h, m] = partido.hora.split(':').map(Number);
+  const utcH = h - 2; // CEST = UTC+2
+  const utcDay = utcH < 0 ? 1 : 0;
+  const utcHAdj = utcH < 0 ? utcH + 24 : utcH;
+  const fechaStr = `${partido.fecha}T${String(utcHAdj).padStart(2,'0')}:${String(m).padStart(2,'0')}:00Z`;
+  return new Date() >= new Date(fechaStr);
+}
+
 // Componente celda de pronóstico
-function PronosticoCell({ jugador, partido, pronostico, onSave, resultado }) {
+function PronosticoCell({ jugador, partido, pronostico, onSave, resultado, adminMode }) {
   const [editing, setEditing] = useState(false);
   const [gL, setGL] = useState('');
   const [gV, setGV] = useState('');
 
+  const bloqueado = partidoEmpezado(partido) && !adminMode;
+
   const startEdit = () => {
-    if (resultado) return; // No se puede cambiar si ya hay resultado
+    if (bloqueado) return;
+    if (resultado && !adminMode) return;
     setGL(pronostico?.golesLocal ?? '');
     setGV(pronostico?.golesVisitante ?? '');
     setEditing(true);
@@ -568,14 +582,19 @@ function PronosticoCell({ jugador, partido, pronostico, onSave, resultado }) {
   return (
     <button
       onClick={startEdit}
-      className={`font-mono text-xs w-full py-1 rounded ${resultado ? 'cursor-default' : 'hover:bg-white/10 cursor-pointer'}`}
-      title={resultado ? 'No se puede modificar' : `Pronóstico de ${jugador}`}
+      disabled={bloqueado}
+      className={`font-mono text-xs w-full py-1 rounded transition-all ${
+        bloqueado ? 'cursor-not-allowed opacity-60' : 'hover:bg-white/10 cursor-pointer'
+      }`}
+      title={bloqueado ? '⏰ Partido ya empezado — no se puede modificar' : `Pronóstico de ${jugador}`}
     >
-      {pronostico !== undefined ? `${pronostico.golesLocal}-${pronostico.golesVisitante}` : <span className="text-gray-500">-</span>}
+      {pronostico !== undefined
+        ? `${pronostico.golesLocal}-${pronostico.golesVisitante}`
+        : <span className={bloqueado ? 'text-gray-600' : 'text-gray-500'}>-</span>
+      }
     </button>
   );
 }
-
 // Componente editor de resultado (modal)
 function ResultadoEditor({ partido, resultadoActual, onSave, onClose }) {
   const [gL, setGL] = useState(resultadoActual?.golesLocal ?? '');
