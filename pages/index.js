@@ -8,6 +8,8 @@ const COLOR_MAP = {
   rojo: 'bg-red-500 text-white',
 };
 
+const SESSION_KEY = 'porra_session';
+
 export default function Home() {
   const [jugadores, setJugadores] = useState([]);
   const [pronosticos, setPronosticos] = useState({});
@@ -17,11 +19,36 @@ export default function Home() {
   const [nuevoJugador, setNuevoJugador] = useState('');
   const [filtroGrupo, setFiltroGrupo] = useState('TODOS');
   const [editandoResultado, setEditandoResultado] = useState(null);
-  const [adminMode, setAdminMode] = useState(false);
-  const [adminPass, setAdminPass] = useState('');
-  const [showAdminModal, setShowAdminModal] = useState(false);
   const [liveData, setLiveData] = useState({});
   const [saving, setSaving] = useState(false);
+  const [user, setUser] = useState(null); // { token, nombre, isAdmin }
+  const [showLogin, setShowLogin] = useState(false);
+
+  const adminMode = user?.isAdmin === true;
+
+  // Cargar sesión guardada y elegir vista inicial según dispositivo
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(SESSION_KEY);
+      if (saved) {
+        setUser(JSON.parse(saved));
+      } else {
+        setShowLogin(true);
+      }
+    } catch {}
+    if (window.innerWidth < 640) setVista('partidos');
+  }, []);
+
+  const login = (data) => {
+    setUser(data);
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+    setShowLogin(false);
+  };
+
+  const logout = () => {
+    setUser(null);
+    localStorage.removeItem(SESSION_KEY);
+  };
 
   const cargarDatos = useCallback(async () => {
     try {
@@ -69,10 +96,18 @@ export default function Home() {
     try {
       const r = await fetch('/api/porra', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(user?.token ? { Authorization: `Bearer ${user.token}` } : {}),
+        },
         body: JSON.stringify({ action, payload }),
       });
       const data = await r.json();
+      if (r.status === 401) {
+        logout();
+        setShowLogin(true);
+        throw new Error(data.error || 'Sesión caducada, inicia sesión de nuevo');
+      }
       if (!r.ok) throw new Error(data.error);
       return data;
     } finally {
@@ -93,19 +128,69 @@ export default function Home() {
 
   const removeJugador = async (nombre) => {
     if (!confirm(`¿Eliminar a ${nombre}?`)) return;
-    const data = await api('removeJugador', { nombre });
-    setJugadores(data.jugadores);
+    try {
+      const data = await api('removeJugador', { nombre });
+      setJugadores(data.jugadores);
+    } catch (e) {
+      alert(e.message);
+    }
   };
 
   const guardarPronostico = async (jugador, partidoId, golesLocal, golesVisitante) => {
     const key = `${jugador}_${partidoId}`;
+    const previo = pronosticos[key];
     setPronosticos(prev => ({ ...prev, [key]: { golesLocal, golesVisitante } }));
-    await api('savePronostico', { jugador, partidoId, golesLocal, golesVisitante });
+    try {
+      await api('savePronostico', { jugador, partidoId, golesLocal, golesVisitante });
+    } catch (e) {
+      setPronosticos(prev => {
+        const copia = { ...prev };
+        if (previo) copia[key] = previo; else delete copia[key];
+        return copia;
+      });
+      alert(e.message);
+    }
+  };
+
+  const borrarPronostico = async (jugador, partidoId) => {
+    const key = `${jugador}_${partidoId}`;
+    const previo = pronosticos[key];
+    setPronosticos(prev => {
+      const copia = { ...prev };
+      delete copia[key];
+      return copia;
+    });
+    try {
+      await api('deletePronostico', { jugador, partidoId });
+    } catch (e) {
+      if (previo) setPronosticos(prev => ({ ...prev, [key]: previo }));
+      alert(e.message);
+    }
   };
 
   const guardarResultado = async (partidoId, golesLocal, golesVisitante) => {
     setResultados(prev => ({ ...prev, [partidoId]: { golesLocal, golesVisitante } }));
-    await api('saveResultado', { partidoId, golesLocal, golesVisitante });
+    try {
+      await api('saveResultado', { partidoId, golesLocal, golesVisitante });
+    } catch (e) {
+      alert(e.message);
+      cargarDatos();
+    }
+    setEditandoResultado(null);
+  };
+
+  const borrarResultado = async (partidoId) => {
+    setResultados(prev => {
+      const copia = { ...prev };
+      delete copia[partidoId];
+      return copia;
+    });
+    try {
+      await api('deleteResultado', { partidoId });
+    } catch (e) {
+      alert(e.message);
+      cargarDatos();
+    }
     setEditandoResultado(null);
   };
 
@@ -117,6 +202,8 @@ export default function Home() {
   };
 
   const getPronostico = (jugador, partidoId) => pronosticos[`${jugador}_${partidoId}`];
+
+  const puedeEditar = (jugador) => adminMode || user?.nombre === jugador;
 
   // Clasificación
   const clasificacion = jugadores.map(j => {
@@ -139,6 +226,12 @@ export default function Home() {
   const grupos = ['TODOS', ...new Set(PARTIDOS.map(p => p.grupo))];
   const partidosFiltrados = filtroGrupo === 'TODOS' ? PARTIDOS : PARTIDOS.filter(p => p.grupo === filtroGrupo);
 
+  const VISTAS = [
+    { id: 'tabla', icono: '📊', label: 'Tabla' },
+    { id: 'partidos', icono: '⚽', label: 'Partidos' },
+    { id: 'clasificacion', icono: '🏆', label: 'Clasif.' },
+  ];
+
   if (loading) return (
     <div className="min-h-screen bg-gray-950 flex items-center justify-center">
       <div className="text-white text-2xl animate-pulse">⚽ Cargando porra...</div>
@@ -149,47 +242,76 @@ export default function Home() {
     <>
       <Head>
         <title>🏆 Porra Mundial 2026</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
       </Head>
 
       <div className="min-h-screen bg-gray-950 text-white">
         {/* Header */}
-        <header className="bg-gradient-to-r from-green-900 via-gray-900 to-red-900 border-b border-gray-700 sticky top-0 z-10">
-          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <h1 className="text-xl font-black tracking-tight">
-              ⚽ <span className="text-yellow-400">PORRA</span> MUNDIAL 2026
+        <header className="bg-gradient-to-r from-green-900 via-gray-900 to-red-900 border-b border-gray-700 sticky top-0 z-20">
+          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-2">
+            <h1 className="text-lg sm:text-xl font-black tracking-tight whitespace-nowrap">
+              ⚽ <span className="text-yellow-400">PORRA</span> <span className="hidden xs:inline">MUNDIAL 2026</span>
             </h1>
-            <div className="flex gap-2 flex-wrap">
-              {['tabla', 'partidos', 'clasificacion'].map(v => (
+
+            {/* Navegación de escritorio */}
+            <div className="hidden sm:flex gap-2 flex-wrap items-center">
+              {VISTAS.map(v => (
                 <button
-                  key={v}
-                  onClick={() => setVista(v)}
-                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold capitalize transition-all ${
-                    vista === v ? 'bg-yellow-400 text-gray-900' : 'bg-gray-800 hover:bg-gray-700'
+                  key={v.id}
+                  onClick={() => setVista(v.id)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all ${
+                    vista === v.id ? 'bg-yellow-400 text-gray-900' : 'bg-gray-800 hover:bg-gray-700'
                   }`}
                 >
-                  {v === 'tabla' ? '📊 Tabla' : v === 'partidos' ? '⚽ Partidos' : '🏆 Clasificación'}
+                  {v.icono} {v.label}
                 </button>
               ))}
-              <button
-                onClick={() => setShowAdminModal(true)}
-                className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all ${
-                  adminMode ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-700 hover:bg-gray-600'
-                }`}
-              >
-                {adminMode ? '🔓 Admin' : '🔒'}
-              </button>
+            </div>
+
+            {/* Usuario */}
+            <div className="flex items-center gap-2">
+              {user ? (
+                <div className="flex items-center gap-2 bg-gray-800/80 rounded-full pl-3 pr-1.5 py-1">
+                  <span className={`text-sm font-semibold capitalize max-w-[100px] truncate ${adminMode ? 'text-red-400' : 'text-yellow-400'}`}>
+                    {adminMode ? '🔓 admin' : user.nombre}
+                  </span>
+                  <button
+                    onClick={() => confirm('¿Cerrar sesión?') && logout()}
+                    className="text-xs bg-gray-700 hover:bg-gray-600 rounded-full px-2 py-1"
+                    title="Cerrar sesión"
+                  >
+                    Salir
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowLogin(true)}
+                  className="px-4 py-1.5 bg-yellow-400 text-gray-900 rounded-lg text-sm font-bold hover:bg-yellow-300"
+                >
+                  Entrar
+                </button>
+              )}
             </div>
           </div>
         </header>
 
-        <main className="max-w-7xl mx-auto px-2 py-4">
+        <main className="max-w-7xl mx-auto px-2 py-4 pb-24 sm:pb-6">
+
+          {/* Aviso si no ha iniciado sesión */}
+          {!user && (
+            <div className="mb-4 p-3 bg-yellow-400/10 border border-yellow-400/40 rounded-xl text-sm flex items-center justify-between gap-2 flex-wrap">
+              <span>👀 Estás en modo solo lectura. Entra con tu nombre para poner tus pronósticos.</span>
+              <button onClick={() => setShowLogin(true)} className="px-3 py-1.5 bg-yellow-400 text-gray-900 rounded-lg font-bold text-sm">
+                Entrar
+              </button>
+            </div>
+          )}
 
           {/* ===== VISTA TABLA ===== */}
           {vista === 'tabla' && (
             <div>
               <div className="mb-4 flex items-center gap-4 flex-wrap">
-                <div className="flex gap-3 text-sm">
+                <div className="flex gap-3 text-xs sm:text-sm flex-wrap">
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-green-500 inline-block"></span> Perfecto (3 pts)</span>
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-yellow-400 inline-block"></span> Tendencia (1 pt)</span>
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-red-500 inline-block"></span> Error (0 pts)</span>
@@ -204,8 +326,13 @@ export default function Home() {
                       <th className="sticky left-0 bg-gray-900 z-10 px-3 py-2 text-left font-semibold border-r border-gray-700">Partido</th>
                       <th className="px-2 py-2 text-center font-semibold text-gray-400 border-r border-gray-700">Resultado</th>
                       {jugadores.map(j => (
-                        <th key={j} className="px-2 py-2 text-center font-semibold capitalize border-r border-gray-700 last:border-r-0 whitespace-nowrap">
-                          {j}
+                        <th
+                          key={j}
+                          className={`px-2 py-2 text-center font-semibold capitalize border-r border-gray-700 last:border-r-0 whitespace-nowrap ${
+                            user?.nombre === j ? 'bg-yellow-400/20 text-yellow-300' : ''
+                          }`}
+                        >
+                          {user?.nombre === j ? `⭐ ${j}` : j}
                         </th>
                       ))}
                     </tr>
@@ -256,8 +383,9 @@ export default function Home() {
                             {editandoResultado === partido.id && (
                               <ResultadoEditor
                                 partido={partido}
-                                resultadoActual={resultado}
+                                resultadoActual={resultados[partido.id]?.golesLocal !== undefined ? resultados[partido.id] : null}
                                 onSave={guardarResultado}
+                                onDelete={borrarResultado}
                                 onClose={() => setEditandoResultado(null)}
                               />
                             )}
@@ -267,15 +395,23 @@ export default function Home() {
                           {jugadores.map(j => {
                             const pron = getPronostico(j, partido.id);
                             const calc = resultado ? calcularPuntos(pron, resultado) : null;
+                            const esPropio = user?.nombre === j;
                             return (
-                              <td key={j} className={`px-1 py-1 text-center border-r border-gray-700 last:border-r-0 ${calc ? COLOR_MAP[calc.color] : ''}`}>
+                              <td
+                                key={j}
+                                className={`px-1 py-1 text-center border-r border-gray-700 last:border-r-0 ${
+                                  calc ? COLOR_MAP[calc.color] : esPropio ? 'bg-yellow-400/5' : ''
+                                }`}
+                              >
                                 <PronosticoCell
                                   jugador={j}
                                   partido={partido}
                                   pronostico={pron}
                                   onSave={guardarPronostico}
+                                  onDelete={borrarPronostico}
                                   resultado={resultado}
                                   adminMode={adminMode}
+                                  editable={puedeEditar(j)}
                                 />
                               </td>
                             );
@@ -338,12 +474,12 @@ export default function Home() {
           {/* ===== VISTA PARTIDOS ===== */}
           {vista === 'partidos' && (
             <div>
-              <div className="flex gap-2 flex-wrap mb-4">
+              <div className="flex gap-2 overflow-x-auto pb-2 mb-3 -mx-2 px-2 sm:flex-wrap sm:overflow-visible">
                 {grupos.map(g => (
                   <button
                     key={g}
                     onClick={() => setFiltroGrupo(g)}
-                    className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all ${
+                    className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all whitespace-nowrap flex-shrink-0 ${
                       filtroGrupo === g ? 'bg-yellow-400 text-gray-900' : 'bg-gray-800 hover:bg-gray-700'
                     }`}
                   >
@@ -351,23 +487,26 @@ export default function Home() {
                   </button>
                 ))}
               </div>
+              {saving && <p className="text-yellow-400 text-sm animate-pulse mb-2">Guardando...</p>}
 
               <div className="grid gap-3 md:grid-cols-2">
                 {partidosFiltrados.map(partido => {
                   const resultado = getResultado(partido.id);
                   const isLive = liveData[partido.id]?.estado === 'IN_PLAY';
+                  const miPron = user && !adminMode ? getPronostico(user.nombre, partido.id) : null;
+                  const bloqueado = (partidoEmpezado(partido) || !!resultado) && !adminMode;
                   return (
                     <div key={partido.id} className="bg-gray-900 border border-gray-700 rounded-xl p-4">
                       <div className="flex items-center justify-between mb-2">
                         <span className="text-xs text-gray-400">{partido.fecha} · {partido.hora} · Grupo {partido.grupo}</span>
                         {isLive && <span className="text-xs text-red-400 animate-pulse font-bold">🔴 EN VIVO</span>}
                       </div>
-                      <div className="flex items-center justify-between mb-3">
-                        <div className="flex items-center gap-2">
+                      <div className="flex items-center justify-between mb-3 gap-2">
+                        <div className="flex items-center gap-2 flex-1 min-w-0">
                           <span className="text-2xl">{partido.flagLocal}</span>
-                          <span className="font-semibold">{partido.local}</span>
+                          <span className="font-semibold text-sm sm:text-base truncate">{partido.local}</span>
                         </div>
-                        <div className="text-center">
+                        <div className="text-center flex-shrink-0">
                           {resultado ? (
                             <span className="text-xl font-black">{resultado.golesLocal} - {resultado.golesVisitante}</span>
                           ) : (
@@ -376,7 +515,7 @@ export default function Home() {
                           {adminMode && (
                             <button
                               onClick={() => setEditandoResultado(partido.id)}
-                              className="block text-xs text-yellow-400 hover:text-yellow-300 mt-1"
+                              className="block text-xs text-yellow-400 hover:text-yellow-300 mt-1 mx-auto"
                             >
                               {resultado ? 'Editar' : '+ Resultado'}
                             </button>
@@ -384,17 +523,30 @@ export default function Home() {
                           {editandoResultado === partido.id && (
                             <ResultadoEditor
                               partido={partido}
-                              resultadoActual={resultado}
+                              resultadoActual={resultados[partido.id]?.golesLocal !== undefined ? resultados[partido.id] : null}
                               onSave={guardarResultado}
+                              onDelete={borrarResultado}
                               onClose={() => setEditandoResultado(null)}
                             />
                           )}
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold">{partido.visitante}</span>
+                        <div className="flex items-center gap-2 flex-1 min-w-0 justify-end">
+                          <span className="font-semibold text-sm sm:text-base truncate">{partido.visitante}</span>
                           <span className="text-2xl">{partido.flagVisitante}</span>
                         </div>
                       </div>
+
+                      {/* Mi pronóstico (editor grande, ideal para móvil) */}
+                      {user && !adminMode && (
+                        <MiPronosticoEditor
+                          partido={partido}
+                          pronostico={miPron}
+                          bloqueado={bloqueado}
+                          resultado={resultado}
+                          onSave={(gL, gV) => guardarPronostico(user.nombre, partido.id, gL, gV)}
+                          onDelete={() => borrarPronostico(user.nombre, partido.id)}
+                        />
+                      )}
 
                       {/* Pronósticos en vista partidos */}
                       <div className="border-t border-gray-800 pt-2 mt-2">
@@ -405,7 +557,7 @@ export default function Home() {
                             const calc = resultado ? calcularPuntos(pron, resultado) : null;
                             const bgClass = calc ? COLOR_MAP[calc.color] : 'bg-gray-800';
                             return (
-                              <div key={j} className={`rounded-lg px-2 py-1 text-xs ${bgClass}`}>
+                              <div key={j} className={`rounded-lg px-2 py-1 text-xs ${bgClass} ${user?.nombre === j ? 'ring-1 ring-yellow-400' : ''}`}>
                                 <span className="font-semibold capitalize">{j}</span>
                                 {pron ? (
                                   <span className="ml-1 font-mono">{pron.golesLocal}-{pron.golesVisitante}</span>
@@ -437,13 +589,15 @@ export default function Home() {
                       i === 1 ? 'bg-gray-400/10 border-gray-400' :
                       i === 2 ? 'bg-orange-900/20 border-orange-700' :
                       'bg-gray-900 border-gray-700'
-                    }`}
+                    } ${user?.nombre === j.nombre ? 'ring-2 ring-yellow-400/60' : ''}`}
                   >
                     <span className="text-2xl font-black w-8 text-center">
                       {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}º`}
                     </span>
                     <div className="flex-1">
-                      <p className="font-bold capitalize text-base">{j.nombre}</p>
+                      <p className="font-bold capitalize text-base">
+                        {j.nombre} {user?.nombre === j.nombre && <span className="text-yellow-400 text-xs">(tú)</span>}
+                      </p>
                       <div className="flex gap-3 text-xs mt-1">
                         <span className="text-green-400">✅ {j.perfectos}</span>
                         <span className="text-yellow-400">🟡 {j.tendencias}</span>
@@ -461,67 +615,29 @@ export default function Home() {
             </div>
           )}
         </main>
+
+        {/* Navegación inferior (móvil) */}
+        <nav className="sm:hidden fixed bottom-0 left-0 right-0 bg-gray-900 border-t border-gray-700 z-20 pb-[env(safe-area-inset-bottom)]">
+          <div className="flex">
+            {VISTAS.map(v => (
+              <button
+                key={v.id}
+                onClick={() => setVista(v.id)}
+                className={`flex-1 flex flex-col items-center py-2.5 text-xs font-semibold transition-colors ${
+                  vista === v.id ? 'text-yellow-400' : 'text-gray-400'
+                }`}
+              >
+                <span className="text-xl leading-none mb-0.5">{v.icono}</span>
+                {v.label}
+              </button>
+            ))}
+          </div>
+        </nav>
       </div>
 
-      {/* Modal Admin */}
-      {showAdminModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-sm">
-            <h3 className="font-bold text-lg mb-4">{adminMode ? '🔓 Modo admin activo' : '🔒 Acceso admin'}</h3>
-            {!adminMode ? (
-              <>
-                <input
-                  type="password"
-                  value={adminPass}
-                  onChange={e => setAdminPass(e.target.value)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') {
-                      if (adminPass === (process.env.NEXT_PUBLIC_ADMIN_PASS || 'mundial2026')) {
-                        setAdminMode(true);
-                        setShowAdminModal(false);
-                        setAdminPass('');
-                      } else {
-                        alert('Contraseña incorrecta');
-                      }
-                    }
-                  }}
-                  placeholder="Contraseña..."
-                  className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 mb-3 focus:outline-none focus:border-yellow-400"
-                />
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => {
-                      if (adminPass === (process.env.NEXT_PUBLIC_ADMIN_PASS || 'mundial2026')) {
-                        setAdminMode(true);
-                        setShowAdminModal(false);
-                        setAdminPass('');
-                      } else alert('Contraseña incorrecta');
-                    }}
-                    className="flex-1 py-2 bg-yellow-400 text-gray-900 font-bold rounded-lg"
-                  >
-                    Entrar
-                  </button>
-                  <button onClick={() => setShowAdminModal(false)} className="flex-1 py-2 bg-gray-700 rounded-lg">
-                    Cancelar
-                  </button>
-                </div>
-                <p className="text-xs text-gray-500 mt-2">Contraseña por defecto: <code>mundial2026</code></p>
-              </>
-            ) : (
-              <div className="flex gap-2">
-                <button
-                  onClick={() => { setAdminMode(false); setShowAdminModal(false); }}
-                  className="flex-1 py-2 bg-red-600 hover:bg-red-500 rounded-lg font-bold"
-                >
-                  Desactivar admin
-                </button>
-                <button onClick={() => setShowAdminModal(false)} className="flex-1 py-2 bg-gray-700 rounded-lg">
-                  Cerrar
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
+      {/* Modal de login */}
+      {showLogin && (
+        <LoginModal onLogin={login} onClose={() => setShowLogin(false)} />
       )}
     </>
   );
@@ -537,17 +653,285 @@ function partidoEmpezado(partido) {
   return new Date() >= new Date(fechaStr);
 }
 
+// ===== Modal de login / registro =====
+function LoginModal({ onLogin, onClose }) {
+  const [step, setStep] = useState('nombre'); // 'nombre' | 'password' | 'crear' | 'admin'
+  const [nombre, setNombre] = useState('');
+  const [canonical, setCanonical] = useState('');
+  const [pass, setPass] = useState('');
+  const [pass2, setPass2] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const authApi = async (action, payload) => {
+    const r = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, payload }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'Error inesperado');
+    return data;
+  };
+
+  const comprobarNombre = async () => {
+    setError('');
+    const n = nombre.trim();
+    if (!n) return;
+    if (n.toLowerCase() === 'admin') {
+      setStep('admin');
+      return;
+    }
+    setBusy(true);
+    try {
+      const data = await authApi('check', { nombre: n });
+      if (!data.exists) {
+        setError('No hay ningún participante con ese nombre. Comprueba que esté bien escrito.');
+        return;
+      }
+      setCanonical(data.nombre);
+      setStep(data.hasPassword ? 'password' : 'crear');
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const crearPassword = async () => {
+    setError('');
+    if (pass.trim().length < 4) { setError('La contraseña debe tener al menos 4 caracteres'); return; }
+    if (pass !== pass2) { setError('Las contraseñas no coinciden'); return; }
+    setBusy(true);
+    try {
+      onLogin(await authApi('register', { nombre: canonical, password: pass.trim() }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const entrar = async () => {
+    setError('');
+    setBusy(true);
+    try {
+      onLogin(await authApi('login', { nombre: canonical, password: pass }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const entrarAdmin = async () => {
+    setError('');
+    setBusy(true);
+    try {
+      onLogin(await authApi('loginAdmin', { password: pass }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const volver = () => {
+    setStep('nombre');
+    setPass('');
+    setPass2('');
+    setError('');
+  };
+
+  const inputClass = 'w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-3 text-base focus:outline-none focus:border-yellow-400';
+  const btnPrimary = 'flex-1 py-3 bg-yellow-400 text-gray-900 font-bold rounded-lg disabled:opacity-50 active:scale-95 transition-transform';
+  const btnSecondary = 'flex-1 py-3 bg-gray-700 rounded-lg active:scale-95 transition-transform';
+
+  return (
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-sm">
+        {step === 'nombre' && (
+          <>
+            <h3 className="font-bold text-lg mb-1">👋 ¡Hola!</h3>
+            <p className="text-sm text-gray-400 mb-4">Escribe tu nombre de participante para entrar.</p>
+            <input
+              value={nombre}
+              onChange={e => setNombre(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && comprobarNombre()}
+              placeholder="Tu nombre..."
+              autoFocus
+              className={`${inputClass} mb-3`}
+            />
+            {error && <p className="text-red-400 text-sm mb-3">{error}</p>}
+            <div className="flex gap-2">
+              <button onClick={comprobarNombre} disabled={busy || !nombre.trim()} className={btnPrimary}>
+                {busy ? '...' : 'Continuar'}
+              </button>
+              <button onClick={onClose} className={btnSecondary}>Solo mirar</button>
+            </div>
+            <p className="text-xs text-gray-500 mt-3">¿Eres el administrador? Escribe <code className="text-gray-400">admin</code> como nombre.</p>
+          </>
+        )}
+
+        {step === 'crear' && (
+          <>
+            <h3 className="font-bold text-lg mb-1">🔐 Crea tu contraseña</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              Primera vez de <span className="text-yellow-400 font-semibold capitalize">{canonical}</span>.
+              Elige una contraseña para proteger tus pronósticos.
+            </p>
+            <input
+              type="password"
+              value={pass}
+              onChange={e => setPass(e.target.value)}
+              placeholder="Contraseña (mín. 4 caracteres)"
+              autoFocus
+              className={`${inputClass} mb-2`}
+            />
+            <input
+              type="password"
+              value={pass2}
+              onChange={e => setPass2(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && crearPassword()}
+              placeholder="Repite la contraseña"
+              className={`${inputClass} mb-3`}
+            />
+            {error && <p className="text-red-400 text-sm mb-3">{error}</p>}
+            <div className="flex gap-2">
+              <button onClick={crearPassword} disabled={busy} className={btnPrimary}>
+                {busy ? '...' : 'Crear y entrar'}
+              </button>
+              <button onClick={volver} className={btnSecondary}>Volver</button>
+            </div>
+          </>
+        )}
+
+        {step === 'password' && (
+          <>
+            <h3 className="font-bold text-lg mb-1">🔑 Hola de nuevo, <span className="capitalize text-yellow-400">{canonical}</span></h3>
+            <p className="text-sm text-gray-400 mb-4">Introduce tu contraseña.</p>
+            <input
+              type="password"
+              value={pass}
+              onChange={e => setPass(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && entrar()}
+              placeholder="Contraseña..."
+              autoFocus
+              className={`${inputClass} mb-3`}
+            />
+            {error && <p className="text-red-400 text-sm mb-3">{error}</p>}
+            <div className="flex gap-2">
+              <button onClick={entrar} disabled={busy || !pass} className={btnPrimary}>
+                {busy ? '...' : 'Entrar'}
+              </button>
+              <button onClick={volver} className={btnSecondary}>Volver</button>
+            </div>
+            <p className="text-xs text-gray-500 mt-3">¿Olvidaste la contraseña? Pídele al admin que te la resetee.</p>
+          </>
+        )}
+
+        {step === 'admin' && (
+          <>
+            <h3 className="font-bold text-lg mb-1">🔒 Acceso admin</h3>
+            <p className="text-sm text-gray-400 mb-4">Introduce la contraseña de administrador.</p>
+            <input
+              type="password"
+              value={pass}
+              onChange={e => setPass(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && entrarAdmin()}
+              placeholder="Contraseña admin..."
+              autoFocus
+              className={`${inputClass} mb-3`}
+            />
+            {error && <p className="text-red-400 text-sm mb-3">{error}</p>}
+            <div className="flex gap-2">
+              <button onClick={entrarAdmin} disabled={busy || !pass} className={btnPrimary}>
+                {busy ? '...' : 'Entrar'}
+              </button>
+              <button onClick={volver} className={btnSecondary}>Volver</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===== Editor grande de "mi pronóstico" (vista partidos, pensado para móvil) =====
+function MiPronosticoEditor({ partido, pronostico, bloqueado, resultado, onSave, onDelete }) {
+  const [gL, setGL] = useState(pronostico?.golesLocal ?? '');
+  const [gV, setGV] = useState(pronostico?.golesVisitante ?? '');
+
+  useEffect(() => {
+    setGL(pronostico?.golesLocal ?? '');
+    setGV(pronostico?.golesVisitante ?? '');
+  }, [pronostico]);
+
+  const cambiado = String(gL) !== String(pronostico?.golesLocal ?? '') || String(gV) !== String(pronostico?.golesVisitante ?? '');
+  const calc = resultado && pronostico ? calcularPuntos(pronostico, resultado) : null;
+
+  if (bloqueado) {
+    return (
+      <div className="bg-gray-800/60 rounded-lg px-3 py-2 mb-2 flex items-center justify-between text-sm">
+        <span className="text-gray-400">⏰ Tu pronóstico:</span>
+        <span className={`font-mono font-bold px-2 py-0.5 rounded ${calc ? COLOR_MAP[calc.color] : ''}`}>
+          {pronostico ? `${pronostico.golesLocal} - ${pronostico.golesVisitante}` : 'sin poner'}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gray-800/60 rounded-lg px-3 py-2.5 mb-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm text-yellow-400 font-semibold flex-shrink-0">⭐ Tu pronóstico</span>
+        <div className="flex items-center gap-1.5">
+          <input
+            type="number" inputMode="numeric" min="0" max="20"
+            value={gL}
+            onChange={e => setGL(e.target.value)}
+            className="w-11 h-11 text-center bg-gray-900 border border-gray-600 rounded-lg text-lg font-bold focus:outline-none focus:border-yellow-400"
+          />
+          <span className="text-gray-400 font-bold">-</span>
+          <input
+            type="number" inputMode="numeric" min="0" max="20"
+            value={gV}
+            onChange={e => setGV(e.target.value)}
+            className="w-11 h-11 text-center bg-gray-900 border border-gray-600 rounded-lg text-lg font-bold focus:outline-none focus:border-yellow-400"
+          />
+          {cambiado && gL !== '' && gV !== '' && (
+            <button
+              onClick={() => onSave(parseInt(gL), parseInt(gV))}
+              className="h-11 px-3 bg-green-600 hover:bg-green-500 rounded-lg font-bold text-sm active:scale-95 transition-transform"
+            >
+              ✓
+            </button>
+          )}
+          {pronostico && (
+            <button
+              onClick={() => confirm('¿Borrar tu pronóstico de este partido?') && onDelete()}
+              className="h-11 px-3 bg-gray-700 hover:bg-red-600 rounded-lg text-sm active:scale-95 transition-transform"
+              title="Borrar pronóstico"
+            >
+              🗑
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Componente celda de pronóstico
-function PronosticoCell({ jugador, partido, pronostico, onSave, resultado, adminMode }) {
+function PronosticoCell({ jugador, partido, pronostico, onSave, onDelete, resultado, adminMode, editable }) {
   const [editing, setEditing] = useState(false);
   const [gL, setGL] = useState('');
   const [gV, setGV] = useState('');
 
-  const bloqueado = partidoEmpezado(partido) && !adminMode;
+  const bloqueado = !editable || ((partidoEmpezado(partido) || !!resultado) && !adminMode);
 
   const startEdit = () => {
     if (bloqueado) return;
-    if (resultado && !adminMode) return;
     setGL(pronostico?.golesLocal ?? '');
     setGV(pronostico?.golesVisitante ?? '');
     setEditing(true);
@@ -555,38 +939,53 @@ function PronosticoCell({ jugador, partido, pronostico, onSave, resultado, admin
 
   const save = async () => {
     if (gL === '' || gV === '') return;
-    await onSave(jugador, partido.id, parseInt(gL), parseInt(gV));
     setEditing(false);
+    await onSave(jugador, partido.id, parseInt(gL), parseInt(gV));
+  };
+
+  const borrar = async () => {
+    if (!confirm(`¿Borrar el pronóstico de ${jugador} para este partido?`)) return;
+    setEditing(false);
+    await onDelete(jugador, partido.id);
   };
 
   if (editing) {
     return (
       <div className="flex items-center gap-0.5">
         <input
-          type="number" min="0" max="20" value={gL} onChange={e => setGL(e.target.value)}
-          className="w-7 text-center bg-gray-800 text-white rounded text-xs p-0.5 border border-yellow-400"
+          type="number" inputMode="numeric" min="0" max="20" value={gL} onChange={e => setGL(e.target.value)}
+          className="w-8 h-8 text-center bg-gray-800 text-white rounded text-sm p-0.5 border border-yellow-400"
           autoFocus
         />
         <span className="text-xs">-</span>
         <input
-          type="number" min="0" max="20" value={gV} onChange={e => setGV(e.target.value)}
-          className="w-7 text-center bg-gray-800 text-white rounded text-xs p-0.5 border border-yellow-400"
+          type="number" inputMode="numeric" min="0" max="20" value={gV} onChange={e => setGV(e.target.value)}
+          className="w-8 h-8 text-center bg-gray-800 text-white rounded text-sm p-0.5 border border-yellow-400"
           onKeyDown={e => e.key === 'Enter' && save()}
         />
-        <button onClick={save} className="text-xs text-green-400 hover:text-green-300 ml-0.5">✓</button>
-        <button onClick={() => setEditing(false)} className="text-xs text-red-400 hover:text-red-300">✕</button>
+        <button onClick={save} className="text-sm text-green-400 hover:text-green-300 ml-0.5 px-0.5">✓</button>
+        {pronostico && (
+          <button onClick={borrar} className="text-sm hover:opacity-80 px-0.5" title="Borrar pronóstico">🗑</button>
+        )}
+        <button onClick={() => setEditing(false)} className="text-sm text-red-400 hover:text-red-300 px-0.5">✕</button>
       </div>
     );
   }
+
+  const titulo = !editable
+    ? `Pronóstico de ${jugador} (solo ${jugador} puede modificarlo)`
+    : bloqueado
+      ? '⏰ Partido ya empezado — no se puede modificar'
+      : `Pronóstico de ${jugador} — toca para editar`;
 
   return (
     <button
       onClick={startEdit}
       disabled={bloqueado}
-      className={`font-mono text-xs w-full py-1 rounded transition-all ${
+      className={`font-mono text-xs w-full py-2 rounded transition-all ${
         bloqueado ? 'cursor-not-allowed opacity-60' : 'hover:bg-white/10 cursor-pointer'
       }`}
-      title={bloqueado ? '⏰ Partido ya empezado — no se puede modificar' : `Pronóstico de ${jugador}`}
+      title={titulo}
     >
       {pronostico !== undefined
         ? `${pronostico.golesLocal}-${pronostico.golesVisitante}`
@@ -595,8 +994,9 @@ function PronosticoCell({ jugador, partido, pronostico, onSave, resultado, admin
     </button>
   );
 }
+
 // Componente editor de resultado (modal)
-function ResultadoEditor({ partido, resultadoActual, onSave, onClose }) {
+function ResultadoEditor({ partido, resultadoActual, onSave, onDelete, onClose }) {
   const [gL, setGL] = useState(resultadoActual?.golesLocal ?? '');
   const [gV, setGV] = useState(resultadoActual?.golesVisitante ?? '');
 
@@ -609,7 +1009,7 @@ function ResultadoEditor({ partido, resultadoActual, onSave, onClose }) {
           <div className="text-center">
             <p className="text-xs text-gray-400 mb-1">{partido.local}</p>
             <input
-              type="number" min="0" max="20" value={gL} onChange={e => setGL(e.target.value)}
+              type="number" inputMode="numeric" min="0" max="20" value={gL} onChange={e => setGL(e.target.value)}
               className="w-16 text-center bg-gray-800 border border-gray-600 rounded-lg p-2 text-xl font-bold focus:outline-none focus:border-yellow-400"
               autoFocus
             />
@@ -618,7 +1018,7 @@ function ResultadoEditor({ partido, resultadoActual, onSave, onClose }) {
           <div className="text-center">
             <p className="text-xs text-gray-400 mb-1">{partido.visitante}</p>
             <input
-              type="number" min="0" max="20" value={gV} onChange={e => setGV(e.target.value)}
+              type="number" inputMode="numeric" min="0" max="20" value={gV} onChange={e => setGV(e.target.value)}
               className="w-16 text-center bg-gray-800 border border-gray-600 rounded-lg p-2 text-xl font-bold focus:outline-none focus:border-yellow-400"
               onKeyDown={e => e.key === 'Enter' && gL !== '' && gV !== '' && onSave(partido.id, parseInt(gL), parseInt(gV))}
             />
@@ -634,6 +1034,14 @@ function ResultadoEditor({ partido, resultadoActual, onSave, onClose }) {
           </button>
           <button onClick={onClose} className="flex-1 py-2 bg-gray-700 rounded-lg">Cancelar</button>
         </div>
+        {resultadoActual && (
+          <button
+            onClick={() => confirm('¿Borrar el resultado manual de este partido?') && onDelete(partido.id)}
+            className="w-full mt-2 py-2 bg-red-900/50 hover:bg-red-800 border border-red-700 text-red-300 rounded-lg text-sm font-semibold"
+          >
+            🗑 Borrar resultado
+          </button>
+        )}
       </div>
     </div>
   );
